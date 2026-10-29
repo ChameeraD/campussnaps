@@ -1,0 +1,711 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  CampusSnaps - a beginner AWS app. A website on EC2 stores event photos in S3.
+  Each upload triggers a Lambda function that saves the photo's details to
+  DynamoDB, where the website reads the gallery. IAM roles connect everything,
+  so there are no access keys anywhere. Deleting the stack deletes everything,
+  photos included.
+
+# ---------------------------------------------------------------------------
+# Deploy (CloudShell):
+#   aws cloudformation deploy --template-file campussnaps.yaml \
+#     --stack-name campussnaps --capabilities CAPABILITY_IAM
+# Delete:
+#   aws cloudformation delete-stack --stack-name campussnaps
+# Or use the CloudFormation console: see README.md.
+# ---------------------------------------------------------------------------
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label: { default: "Server" }
+        Parameters: [InstanceType, LatestAmiId]
+    ParameterLabels:
+      InstanceType: { default: "EC2 instance type (keep t3.micro if unsure)" }
+      LatestAmiId: { default: "Operating system image (leave as is)" }
+
+Parameters:
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t8i.micro, t8i.small]
+    Description: >-
+      Free Tier eligible types. They are allowed on the Free plan and are paid
+      from your credits (t3.micro is about 1 US cent an hour).
+  LatestAmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: The latest Amazon Linux 2023 image, looked up automatically in any Region.
+
+Resources:
+
+  # =========================================================================
+  # Network: a small private network with one public subnet.
+  # No NAT gateway (about $32 a month), so nothing here costs money by itself.
+  # =========================================================================
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags: [{ Key: Name, Value: campussnaps-vpc }]
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags: [{ Key: Name, Value: campussnaps-igw }]
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags: [{ Key: Name, Value: campussnaps-public }]
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+      Tags: [{ Key: Name, Value: campussnaps-public }]
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnetRouteTable:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet
+      RouteTableId: !Ref PublicRouteTable
+
+  # =========================================================================
+  # Decision 2 - Files: Amazon S3, the photo store
+  # =========================================================================
+  PhotoBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: GalleryFunctionPermission
+    Properties:
+      BucketName: !Sub campussnaps-${AWS::AccountId}-${AWS::Region}
+      PublicAccessBlockConfiguration:      # private: all four settings on
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      NotificationConfiguration:           # "a photo arrived" -> Lambda
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: uploads/
+            Function: !GetAtt GalleryFunction.Arn
+
+  # =========================================================================
+  # Decision 3 - Data: Amazon DynamoDB, one item per photo
+  # =========================================================================
+  PhotosTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST          # on-demand: pay per request, nothing to size
+      AttributeDefinitions:
+        - { AttributeName: eventId, AttributeType: S }
+        - { AttributeName: photoId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: eventId, KeyType: HASH }    # partition key: groups photos by event
+        - { AttributeName: photoId, KeyType: RANGE }   # sort key: timestamp first, so newest first
+
+  # =========================================================================
+  # Decision 1 - Compute: AWS Lambda, runs only when a photo arrives
+  # =========================================================================
+  GalleryFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Saves each new photo's details to DynamoDB when it lands in uploads/
+      Runtime: python3.12
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 30
+      Role: !GetAtt GalleryFunctionRole.Arn
+      Environment:
+        Variables:
+          TABLE: !Ref PhotosTable
+      Code:
+        ZipFile: |
+          """CampusSnaps gallery function (AWS Lambda).
+
+          S3 calls this function every time a photo lands in uploads/. It reads the
+          photo's details from S3 and saves them as one item in the DynamoDB table.
+          The website reads the gallery from that table.
+          """
+          import os
+          import urllib.parse
+
+          import boto3
+
+          s3 = boto3.client("s3")
+          table = boto3.resource("dynamodb").Table(os.environ["TABLE"])
+
+
+          def handler(event, context):
+              saved = 0
+              for record in event.get("Records", []):
+                  bucket = record["s3"]["bucket"]["name"]
+                  # Keys arrive URL-encoded in S3 events (a space becomes "+").
+                  key = urllib.parse.unquote_plus(record["s3"]["object"]["key"])
+                  head = s3.head_object(Bucket=bucket, Key=key)
+                  meta = head.get("Metadata", {})
+                  item = {
+                      "eventId": meta.get("event", "campus-life"),
+                      "photoId": key.split("/", 1)[-1],
+                      "s3Key": key,
+                      "caption": urllib.parse.unquote(meta.get("caption", "")),
+                      "sizeBytes": head["ContentLength"],
+                      "uploadedAt": head["LastModified"].isoformat(),
+                      "likes": 0,
+                  }
+                  try:
+                      # S3 can deliver the same event twice. The condition makes a repeat harmless.
+                      table.put_item(Item=item, ConditionExpression="attribute_not_exists(photoId)")
+                      saved += 1
+                      print("Saved", item["photoId"], "to event", item["eventId"])
+                  except table.meta.client.exceptions.ConditionalCheckFailedException:
+                      print("Already saved", item["photoId"])
+              return {"saved": saved}
+
+  GalleryFunctionPermission:               # resource-based policy: only this bucket may call it
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref GalleryFunction
+      Principal: s3.amazonaws.com
+      SourceAccount: !Ref AWS::AccountId
+      SourceArn: !Sub arn:aws:s3:::campussnaps-${AWS::AccountId}-${AWS::Region}
+
+  GalleryFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${GalleryFunction}
+      RetentionInDays: 7
+
+  # =========================================================================
+  # Decision 4 - Access: AWS IAM roles, least privilege, no access keys
+  # =========================================================================
+  GalleryFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:            # trust policy: only Lambda may use this role
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole   # write its own logs
+      Policies:
+        - PolicyName: gallery-least-privilege
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow              # read a new photo's details
+                Action: s3:GetObject
+                Resource: !Sub arn:aws:s3:::campussnaps-${AWS::AccountId}-${AWS::Region}/uploads/*
+              - Effect: Allow              # add one item per photo, nothing else
+                Action: dynamodb:PutItem
+                Resource: !GetAtt PhotosTable.Arn
+
+  WebServerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:            # trust policy: only EC2 may use this role
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: ec2.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore   # browser terminal (Session Manager), no SSH keys
+      Policies:
+        - PolicyName: webapp-least-privilege
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow              # upload into uploads/ only
+                Action: s3:PutObject
+                Resource: !Sub ${PhotoBucket.Arn}/uploads/*
+              - Effect: Allow              # read photos, to make 1-hour presigned links
+                Action: s3:GetObject
+                Resource: !Sub ${PhotoBucket.Arn}/uploads/*
+              - Effect: Allow              # read the gallery and add likes
+                Action: [dynamodb:Query, dynamodb:UpdateItem]
+                Resource: !GetAtt PhotosTable.Arn
+
+  WebServerInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref WebServerRole]
+
+  # =========================================================================
+  # Decision 1 - Compute: Amazon EC2, the always-on website
+  # =========================================================================
+  WebServerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: CampusSnaps web server - HTTP from anywhere, no SSH
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp                  # port 80 only. Every other port stays closed.
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+      Tags: [{ Key: Name, Value: campussnaps-web }]
+
+  WebServer:
+    Type: AWS::EC2::Instance
+    DependsOn: PublicRoute                 # the server needs internet to install the app
+    Properties:
+      ImageId: !Ref LatestAmiId
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref PublicSubnet
+      SecurityGroupIds: [!Ref WebServerSecurityGroup]
+      IamInstanceProfile: !Ref WebServerInstanceProfile
+      Tags: [{ Key: Name, Value: campussnaps-web }]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          # Runs once, the first time the server starts: install and start the app.
+          set -x
+          dnf install -y python3-boto3 || (dnf install -y python3-pip && pip3 install boto3)
+          mkdir -p /opt/campussnaps
+          cat > /opt/campussnaps/app.py <<'PYEOF'
+          """CampusSnaps web app: runs on Amazon EC2.
+
+          Photos are stored in Amazon S3. Their details (event, caption, likes) live in
+          Amazon DynamoDB, where the gallery Lambda function writes them. The EC2
+          instance's IAM role supplies credentials, so there are no access keys anywhere
+          in this code. Standard library + boto3 only, so it runs on a fresh Amazon Linux
+          2023 server with no build step.
+          """
+          import html
+          import os
+          import re
+          import time
+          import urllib.parse
+          import urllib.request
+          from email.parser import BytesParser
+          from email.policy import default as default_policy
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+          import boto3
+          from boto3.dynamodb.conditions import Key
+          from botocore.config import Config
+          from botocore.exceptions import ClientError
+
+          BUCKET = os.environ["BUCKET"]
+          TABLE = os.environ["TABLE"]
+          REGION = os.environ.get("AWS_REGION", "us-east-1")
+          PORT = int(os.environ.get("PORT", "80"))
+          MAX_BYTES = 5 * 1024 * 1024  # 5 MB per photo
+
+          # The events students can upload to. Each one is a partition key in DynamoDB.
+          EVENTS = {
+              "sports-day-2026": "Sports Day 2026",
+              "freshers-night-2026": "Freshers' Night 2026",
+              "campus-life": "Campus life",
+          }
+          DEFAULT_EVENT = "sports-day-2026"
+
+          s3 = boto3.client(
+              "s3",
+              region_name=REGION,
+              endpoint_url="https://s3." + REGION + ".amazonaws.com",
+              config=Config(signature_version="s3v4"),
+          )
+          table = boto3.resource("dynamodb", region_name=REGION).Table(TABLE)
+
+
+          def instance_info():
+              """Read the instance ID and Availability Zone from EC2 metadata (IMDSv2)."""
+              try:
+                  token_req = urllib.request.Request(
+                      "http://169.254.169.254/latest/api/token",
+                      method="PUT",
+                      headers={"X-aws-ec2-metadata-token-ttl-seconds": "300"},
+                  )
+                  token = urllib.request.urlopen(token_req, timeout=1).read().decode()
+
+                  def meta(path):
+                      req = urllib.request.Request(
+                          "http://169.254.169.254/latest/meta-data/" + path,
+                          headers={"X-aws-ec2-metadata-token": token},
+                      )
+                      return urllib.request.urlopen(req, timeout=1).read().decode()
+
+                  return meta("instance-id"), meta("placement/availability-zone")
+              except Exception:
+                  return "local-test", "no-az"
+
+
+          INSTANCE_ID, AZ = instance_info()
+
+          PAGE = """<!doctype html>
+          <html lang="en"><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width, initial-scale=1">
+          {refresh}
+          <title>CampusSnaps</title>
+          <style>
+            :root {{ --ink:#16213e; --muted:#5b6478; --accent:#ff9900; --bg:#f6f7fb; --card:#fff; }}
+            * {{ box-sizing:border-box; }}
+            body {{ margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:var(--bg); color:var(--ink); }}
+            header {{ background:var(--ink); color:#fff; padding:24px 16px; }}
+            header h1 {{ margin:0; font-size:28px; }}
+            header h1 span {{ color:var(--accent); }}
+            header p {{ margin:6px 0 0; opacity:.8; }}
+            main {{ max-width:960px; margin:0 auto; padding:20px 16px 40px; }}
+            .card {{ background:var(--card); border-radius:12px; padding:18px; box-shadow:0 1px 3px rgba(0,0,0,.08); margin-bottom:20px; }}
+            .note {{ background:#fff4e0; border-left:4px solid var(--accent); padding:12px 14px; border-radius:8px; margin-bottom:20px; }}
+            form.upload {{ display:flex; gap:10px; flex-wrap:wrap; align-items:center; }}
+            input[type=text], select {{ padding:9px 10px; border:1px solid #cdd2dd; border-radius:8px; font:inherit; }}
+            button {{ background:var(--accent); border:0; color:#111; font-weight:600; padding:10px 18px; border-radius:8px; cursor:pointer; font:inherit; }}
+            nav {{ display:flex; gap:8px; flex-wrap:wrap; margin-bottom:16px; }}
+            nav a {{ padding:8px 14px; border-radius:999px; background:#e4e7ef; color:var(--ink); text-decoration:none; font-size:14px; }}
+            nav a.on {{ background:var(--ink); color:#fff; }}
+            .grid {{ display:grid; grid-template-columns:repeat(auto-fill,minmax(200px,1fr)); gap:12px; }}
+            .grid figure {{ margin:0; background:var(--card); border-radius:10px; overflow:hidden; box-shadow:0 1px 3px rgba(0,0,0,.08); }}
+            .grid img {{ width:100%; height:170px; object-fit:cover; display:block; }}
+            .grid figcaption {{ display:flex; justify-content:space-between; align-items:center; gap:8px; padding:8px 10px; font-size:14px; }}
+            .grid figcaption span {{ color:var(--muted); word-break:break-word; }}
+            button.like {{ background:#f1f2f6; padding:6px 10px; font-size:13px; white-space:nowrap; }}
+            footer {{ font-size:12px; color:var(--muted); text-align:center; padding:16px; }}
+          </style></head>
+          <body>
+          <header><h1>Campus<span>Snaps</span></h1><p>Share photos from campus events</p></header>
+          <main>
+          {banner}
+          <div class="card">
+            <form class="upload" action="/upload" method="post" enctype="multipart/form-data">
+              <select name="event">{options}</select>
+              <input type="text" name="caption" maxlength="100" placeholder="Caption (optional)">
+              <input type="file" name="photo" accept="image/*" required>
+              <button type="submit">Upload photo</button>
+            </form>
+          </div>
+          <nav>{tabs}</nav>
+          <h2>{event_name} ({count})</h2>
+          {gallery}
+          </main>
+          <footer>Served by EC2 instance {instance} in {az} &middot; photos in Amazon S3 &middot;
+          details in Amazon DynamoDB &middot; added by AWS Lambda</footer>
+          </body></html>"""
+
+
+          def esc(value):
+              return html.escape(str(value), quote=True)
+
+
+          def photos_for(event_id):
+              """One DynamoDB query: every photo for one event, newest first."""
+              resp = table.query(
+                  KeyConditionExpression=Key("eventId").eq(event_id),
+                  ScanIndexForward=False,  # photoIds start with a timestamp, so this is newest first
+                  Limit=60,
+              )
+              return resp.get("Items", [])
+
+
+          def render(event_id, banner=""):
+              photos = photos_for(event_id)
+              if photos:
+                  items = []
+                  for p in photos:
+                      # A presigned link: the bucket stays private, and this link works for 1 hour.
+                      url = s3.generate_presigned_url(
+                          "get_object", Params={"Bucket": BUCKET, "Key": p["s3Key"]}, ExpiresIn=3600
+                      )
+                      caption = p.get("caption") or p["photoId"].split("-", 1)[-1]
+                      items.append(
+                          '<figure id="' + esc(p["photoId"]) + '"><img src="' + esc(url) + '" alt="'
+                          + esc(caption) + '" loading="lazy"><figcaption><span>' + esc(caption)
+                          + '</span><form method="post" action="/like">'
+                          + '<input type="hidden" name="eventId" value="' + esc(event_id) + '">'
+                          + '<input type="hidden" name="photoId" value="' + esc(p["photoId"]) + '">'
+                          + '<button class="like" type="submit">&#9829; ' + str(int(p.get("likes", 0)))
+                          + "</button></form></figcaption></figure>"
+                      )
+                  gallery = '<div class="grid">' + "".join(items) + "</div>"
+              else:
+                  gallery = '<p class="card">No photos for this event yet. Upload the first one!</p>'
+              tabs = "".join(
+                  '<a href="/?event=' + eid + '"' + (' class="on"' if eid == event_id else "") + ">"
+                  + esc(name) + "</a>"
+                  for eid, name in EVENTS.items()
+              )
+              options = "".join(
+                  '<option value="' + eid + '"' + (" selected" if eid == event_id else "") + ">"
+                  + esc(name) + "</option>"
+                  for eid, name in EVENTS.items()
+              )
+              return PAGE.format(
+                  refresh='<meta http-equiv="refresh" content="4;url=/?event=' + event_id + '">' if banner else "",
+                  banner=banner,
+                  options=options,
+                  tabs=tabs,
+                  event_name=esc(EVENTS[event_id]),
+                  count=len(photos),
+                  gallery=gallery,
+                  instance=esc(INSTANCE_ID),
+                  az=esc(AZ),
+              )
+
+
+          def parse_form(content_type, body):
+              """Split a multipart/form-data body into {field name: (filename, type, bytes)}."""
+              msg = BytesParser(policy=default_policy).parsebytes(
+                  b"MIME-Version: 1.0\r\nContent-Type: " + content_type.encode() + b"\r\n\r\n" + body
+              )
+              fields = {}
+              if msg.is_multipart():
+                  for part in msg.iter_parts():
+                      name = part.get_param("name", header="content-disposition")
+                      if name:
+                          fields[name] = (part.get_filename(), part.get_content_type(), part.get_payload(decode=True) or b"")
+              return fields
+
+
+          def pick_event(value):
+              return value if value in EVENTS else DEFAULT_EVENT
+
+
+          class Handler(BaseHTTPRequestHandler):
+              def send_html(self, status, text):
+                  data = text.encode()
+                  self.send_response(status)
+                  self.send_header("Content-Type", "text/html; charset=utf-8")
+                  self.send_header("Content-Length", str(len(data)))
+                  self.end_headers()
+                  self.wfile.write(data)
+
+              def redirect(self, location):
+                  self.send_response(303)
+                  self.send_header("Location", location)
+                  self.end_headers()
+
+              def do_GET(self):
+                  try:
+                      url = urllib.parse.urlsplit(self.path)
+                      query = urllib.parse.parse_qs(url.query)
+                      if url.path == "/health":
+                          return self.send_html(200, "ok")
+                      if url.path not in ("/", "/index.html"):
+                          return self.send_html(404, "Not found")
+                      event_id = pick_event(query.get("event", [DEFAULT_EVENT])[0])
+                      banner = ""
+                      if "uploaded" in query:
+                          banner = '<div class="note">Photo received! Lambda is adding it to the gallery&hellip;</div>'
+                      self.send_html(200, render(event_id, banner))
+                  except Exception as err:  # keep the demo page alive and show what went wrong
+                      self.send_html(500, "Something went wrong: " + esc(err))
+
+              def do_POST(self):
+                  try:
+                      if self.path == "/upload":
+                          return self.upload()
+                      if self.path == "/like":
+                          return self.like()
+                      self.send_html(404, "Not found")
+                  except Exception as err:
+                      self.send_html(500, "Request failed: " + esc(err))
+
+              def upload(self):
+                  length = int(self.headers.get("Content-Length") or 0)
+                  if length <= 0 or length > MAX_BYTES:
+                      return self.send_html(413, "Please upload a photo under 5 MB. <a href='/'>Back</a>")
+                  fields = parse_form(self.headers.get("Content-Type", ""), self.rfile.read(length))
+                  filename, content_type, data = fields.get("photo", (None, "", b""))
+                  if not data or not content_type.startswith("image/"):
+                      return self.send_html(400, "That doesn't look like an image. <a href='/'>Back</a>")
+                  event_id = pick_event(fields.get("event", (None, "", b""))[2].decode(errors="ignore"))
+                  caption = fields.get("caption", (None, "", b""))[2].decode(errors="ignore").strip()[:100]
+                  safe = re.sub(r"[^A-Za-z0-9._-]", "-", filename or "photo")[-60:]
+                  photo_id = str(int(time.time() * 1000)) + "-" + safe
+                  s3.put_object(
+                      Bucket=BUCKET,
+                      Key="uploads/" + photo_id,  # uploads/ is the prefix that triggers Lambda
+                      Body=data,
+                      ContentType=content_type,
+                      # S3 metadata must be plain ASCII, so the caption is URL-encoded.
+                      Metadata={"event": event_id, "caption": urllib.parse.quote(caption)},
+                  )
+                  self.redirect("/?event=" + event_id + "&uploaded=1")
+
+              def like(self):
+                  length = int(self.headers.get("Content-Length") or 0)
+                  form = urllib.parse.parse_qs(self.rfile.read(min(length, 4096)).decode(errors="ignore"))
+                  event_id = pick_event(form.get("eventId", [""])[0])
+                  photo_id = form.get("photoId", [""])[0][:200]
+                  try:
+                      # ADD is atomic: two students liking at the same moment both count.
+                      table.update_item(
+                          Key={"eventId": event_id, "photoId": photo_id},
+                          UpdateExpression="ADD likes :one",
+                          ConditionExpression="attribute_exists(photoId)",
+                          ExpressionAttributeValues={":one": 1},
+                      )
+                  except ClientError as err:
+                      if err.response["Error"]["Code"] != "ConditionalCheckFailedException":
+                          raise
+                  self.redirect("/?event=" + event_id + "#" + urllib.parse.quote(photo_id))
+
+
+          if __name__ == "__main__":
+              print("CampusSnaps listening on port", PORT, "bucket", BUCKET, "table", TABLE)
+              ThreadingHTTPServer(("", PORT), Handler).serve_forever()
+          PYEOF
+          cat > /etc/systemd/system/campussnaps.service <<'UNITEOF'
+          [Unit]
+          Description=CampusSnaps web app
+          After=network-online.target
+          [Service]
+          Environment=BUCKET=${PhotoBucket}
+          Environment=TABLE=${PhotosTable}
+          Environment=AWS_REGION=${AWS::Region}
+          ExecStart=/usr/bin/python3 /opt/campussnaps/app.py
+          Restart=always
+          RestartSec=3
+          [Install]
+          WantedBy=multi-user.target
+          UNITEOF
+          systemctl daemon-reload
+          systemctl enable --now campussnaps
+
+  # =========================================================================
+  # Clean-up helper: empties the bucket when you delete the stack,
+  # so "Delete stack" removes everything in one step.
+  # =========================================================================
+  EmptyBucketFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      Description: Empties the CampusSnaps photo bucket when the stack is deleted
+      Runtime: python3.12
+      Handler: index.handler
+      MemorySize: 128
+      Timeout: 300
+      Role: !GetAtt EmptyBucketFunctionRole.Arn
+      Code:
+        ZipFile: |
+          """Clean-up helper (a CloudFormation custom resource).
+
+          S3 refuses to delete a bucket that still has photos in it. When you delete
+          the stack, CloudFormation calls this function first, and it empties the
+          photo bucket so the whole stack can be deleted in one step.
+          """
+          import json
+          import urllib.request
+
+          import boto3
+
+          s3 = boto3.client("s3")
+
+
+          def send(event, context, status, reason):
+              body = json.dumps({
+                  "Status": status,
+                  "Reason": reason or "See CloudWatch Logs: " + context.log_stream_name,
+                  "PhysicalResourceId": event.get("PhysicalResourceId", "empty-bucket-on-delete"),
+                  "StackId": event["StackId"],
+                  "RequestId": event["RequestId"],
+                  "LogicalResourceId": event["LogicalResourceId"],
+                  "Data": {},
+              }).encode()
+              request = urllib.request.Request(
+                  event["ResponseURL"], data=body, method="PUT",
+                  headers={"Content-Type": "", "Content-Length": str(len(body))},
+              )
+              urllib.request.urlopen(request, timeout=10)
+
+
+          def handler(event, context):
+              status, reason = "SUCCESS", ""
+              try:
+                  if event["RequestType"] == "Delete":
+                      bucket = event["ResourceProperties"]["BucketName"]
+                      deleted = 0
+                      for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket):
+                          objects = [{"Key": obj["Key"]} for obj in page.get("Contents", [])]
+                          if objects:
+                              s3.delete_objects(Bucket=bucket, Delete={"Objects": objects, "Quiet": True})
+                              deleted += len(objects)
+                      print("Deleted", deleted, "objects from", bucket)
+              except s3.exceptions.NoSuchBucket:
+                  print("Bucket is already gone")
+              except Exception as err:
+                  print("Could not empty the bucket:", repr(err))
+                  status, reason = "FAILED", "Could not empty the bucket: " + str(err)[:200]
+              send(event, context, status, reason)
+
+  EmptyBucketFunctionLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${EmptyBucketFunction}
+      RetentionInDays: 7
+
+  EmptyBucketFunctionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: empty-photo-bucket
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt PhotoBucket.Arn
+              - Effect: Allow
+                Action: s3:DeleteObject
+                Resource: !Sub ${PhotoBucket.Arn}/*
+
+  EmptyBucketOnDelete:
+    Type: Custom::EmptyBucket
+    DependsOn: EmptyBucketFunctionLogs
+    Properties:
+      ServiceToken: !GetAtt EmptyBucketFunction.Arn
+      BucketName: !Ref PhotoBucket
+
+Outputs:
+  WebsiteURL:
+    Description: Open this in a browser. Allow 1-2 minutes after the stack completes.
+    Value: !Sub http://${WebServer.PublicDnsName}
+  PhotoBucketName:
+    Description: Where the photos are stored (Amazon S3)
+    Value: !Ref PhotoBucket
+  PhotosTableName:
+    Description: Where each photo's details and likes are stored (Amazon DynamoDB)
+    Value: !Ref PhotosTable
+  GalleryFunctionName:
+    Description: The Lambda function that runs on every upload. Check its logs in CloudWatch.
+    Value: !Ref GalleryFunction
